@@ -8,13 +8,14 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from PyQt6.QtCore import QMarginsF, QRectF, QSizeF, Qt, QTimer
+from PyQt6.QtCore import QMarginsF, QRectF, QSizeF, Qt, QTimer, QEvent
 from PyQt6.QtGui import (
     QAction,
     QColor,
     QFont,
     QFontDatabase,
     QGuiApplication,
+    QKeyEvent,
     QKeySequence,
     QPageLayout,
     QPageSize,
@@ -59,6 +60,7 @@ except ImportError:
     RGBColor = None
 
 from hinglish_kruti import hinglish_document_to_krutidev, hinglish_selection_to_krutidev
+from word_suggester import WordSuggester, SuggestionPopup
 
 # Paper presets: label -> QPageSize.PageSizeId
 PAPER_PRESETS: list[tuple[str, QPageSize.PageSizeId]] = [
@@ -291,6 +293,118 @@ class RibbonGroup(QFrame):
         self._row.addWidget(w)
 
 
+class SmartQTextEdit(QTextEdit):
+    """QTextEdit with intelligent Hinglish→Kruti suggestions on space key."""
+    
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.suggester = WordSuggester()
+        self.suggestion_popup: SuggestionPopup | None = None
+        self._last_word_start = 0
+        self._is_applying_suggestion = False
+    
+    def set_suggestion_popup(self, popup: SuggestionPopup) -> None:
+        """Set the popup widget for suggestions."""
+        self.suggestion_popup = popup
+        if popup:
+            popup.suggestion_selected.connect(self._on_suggestion_selected)
+    
+    def _position_popup(self) -> None:
+        """Position the suggestion popup near the cursor."""
+        if not self.suggestion_popup:
+            return
+        
+        cursor_rect = self.cursorRect()
+        popup_pos = self.mapToGlobal(cursor_rect.bottomLeft())
+        self.suggestion_popup.move(popup_pos)
+    
+    def keyPressEvent(self, event) -> None:
+        """Handle key press events for space and tab."""
+        if event.key() == Qt.Key.Key_Space and not self._is_applying_suggestion:
+            # Get the word before cursor
+            cursor = self.textCursor()
+            block = cursor.block()
+            pos_in_block = cursor.positionInBlock()
+            block_text = block.text()
+            
+            # Find word boundaries
+            word_start = pos_in_block - 1
+            while word_start >= 0 and block_text[word_start] not in ' \t':
+                word_start -= 1
+            word_start += 1
+            
+            word = block_text[word_start:pos_in_block].strip()
+            
+            # Show suggestions if word is Hinglish (Latin characters)
+            if word and word.isalpha():
+                suggestions = self.suggester.get_suggestions(word)
+                if suggestions and self.suggestion_popup:
+                    self.suggestion_popup.show_suggestions(word, suggestions)
+                    self._position_popup()
+                    self._last_word_start = block.position() + word_start
+                    # Don't insert space yet, wait for user to accept or reject
+                    return
+            
+            # Insert space normally if no suggestions
+            super().keyPressEvent(event)
+        
+        elif event.key() == Qt.Key.Key_Tab and self.suggestion_popup and self.suggestion_popup.isVisible():
+            # Replace word with suggestion on Tab
+            kruti_word = self.suggestion_popup.get_selected_suggestion()
+            if kruti_word:
+                self._apply_suggestion(kruti_word)
+            return
+        
+        elif event.key() == Qt.Key.Key_Escape and self.suggestion_popup and self.suggestion_popup.isVisible():
+            # Close popup and insert space
+            self.suggestion_popup.hide()
+            super().keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Space, Qt.KeyboardModifier.NoModifier, " "))
+        
+        else:
+            # Other keys - hide popup and process normally
+            if self.suggestion_popup and self.suggestion_popup.isVisible():
+                self.suggestion_popup.hide()
+            super().keyPressEvent(event)
+    
+    def _apply_suggestion(self, kruti_word: str) -> None:
+        """Replace the current word with the suggested Kruti word."""
+        self._is_applying_suggestion = True
+        
+        cursor = self.textCursor()
+        block = cursor.block()
+        pos_in_block = cursor.positionInBlock()
+        block_text = block.text()
+        
+        # Find word boundaries
+        word_start = pos_in_block - 1
+        while word_start >= 0 and block_text[word_start] not in ' \t':
+            word_start -= 1
+        word_start += 1
+        
+        # Select and delete the word
+        cursor.setPosition(block.position() + word_start)
+        cursor.movePosition(QTextCursor.MoveOperation.EndOfWord, QTextCursor.MoveMode.KeepAnchor)
+        
+        # Apply Kruti formatting
+        fmt = QTextCharFormat()
+        if hasattr(self.parent(), 'kruti_family'):
+            kruti_family = self.parent().kruti_family
+            if kruti_family:
+                fmt.setFontFamily(kruti_family)
+        
+        cursor.insertText(kruti_word + " ", fmt)
+        self.setTextCursor(cursor)
+        
+        if self.suggestion_popup:
+            self.suggestion_popup.hide()
+        
+        self._is_applying_suggestion = False
+    
+    def _on_suggestion_selected(self, kruti_word: str) -> None:
+        """Handle suggestion selection from popup."""
+        self._apply_suggestion(kruti_word)
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -308,6 +422,11 @@ class MainWindow(QMainWindow):
 
         self._build_menu_bar()
         self._build_central_page_editor()
+        
+        # Create and connect suggestion popup
+        self.suggestion_popup = SuggestionPopup(self)
+        self.editor.set_suggestion_popup(self.suggestion_popup)
+        
         self._build_ribbon()
         self._build_status_hint()
 
@@ -548,7 +667,7 @@ class MainWindow(QMainWindow):
         )
         self.header_edit.hide()
 
-        self.editor = QTextEdit()
+        self.editor = SmartQTextEdit()
         self.editor.setObjectName("body")
         self.editor.setAcceptRichText(True)
         self.editor.setPlaceholderText("Document text…")
