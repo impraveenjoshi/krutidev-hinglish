@@ -52,8 +52,11 @@ from PyQt6.QtWidgets import (
 
 try:
     from docx import Document
+    from docx.shared import Pt, RGBColor
 except ImportError:
     Document = None
+    Pt = None
+    RGBColor = None
 
 from hinglish_kruti import hinglish_document_to_krutidev, hinglish_selection_to_krutidev
 
@@ -553,9 +556,9 @@ class MainWindow(QMainWindow):
         self.editor.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.editor.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.editor.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        # Initial stylesheet - will be updated by _apply_frame_margins()
         self.editor.setStyleSheet(
-            "QTextEdit#body { background: #ffffff; border: none; font-size: 11pt; "
-            "padding: 8px; }"
+            "QTextEdit#body { background: #d3d3d3; border: none; font-size: 11pt; padding: 12px; }"
         )
 
         page_sheet = QFrame()
@@ -645,11 +648,30 @@ class MainWindow(QMainWindow):
         root = doc.rootFrame()
         fmt = root.frameFormat()
         dpi = self._dpi()
-        fmt.setLeftMargin(cm_to_px(self._margins_cm["L"], dpi))
-        fmt.setRightMargin(cm_to_px(self._margins_cm["R"], dpi))
-        fmt.setTopMargin(cm_to_px(self._margins_cm["T"], dpi))
-        fmt.setBottomMargin(cm_to_px(self._margins_cm["B"], dpi))
+        
+        # Set document margins from UI
+        left_margin = cm_to_px(self._margins_cm["L"], dpi)
+        right_margin = cm_to_px(self._margins_cm["R"], dpi)
+        top_margin = cm_to_px(self._margins_cm["T"], dpi)
+        bottom_margin = cm_to_px(self._margins_cm["B"], dpi)
+        
+        fmt.setLeftMargin(left_margin)
+        fmt.setRightMargin(right_margin)
+        fmt.setTopMargin(top_margin)
+        
+        # Add visual spacing between pages (16px above and below each page)
+        # This creates clear page separation in the editor
+        fmt.setBottomMargin(bottom_margin + 16)
+        fmt.setTopMargin(top_margin + 8)
+        
+        # Set page background to white
+        fmt.setBackground(QColor("#ffffff"))
         root.setFrameFormat(fmt)
+        
+        # Set editor background to light gray to show page boundaries
+        self.editor.setStyleSheet(
+            "QTextEdit#body { background: #d3d3d3; border: none; font-size: 11pt; padding: 12px; }"
+        )
 
     def _on_paper_changed(self) -> None:
         pid = self.paper_combo.currentData()
@@ -758,7 +780,16 @@ class MainWindow(QMainWindow):
         d.setDefaultFont(self.editor.document().defaultFont())
         w_pt, h_pt = self._page_size_points()
         d.setPageSize(QSizeF(w_pt, h_pt))
-        d.rootFrame().setFrameFormat(self.editor.document().rootFrame().frameFormat())
+        
+        # Copy frame formatting including margins and background
+        source_fmt = self.editor.document().rootFrame().frameFormat()
+        target_fmt = d.rootFrame().frameFormat()
+        target_fmt.setLeftMargin(source_fmt.leftMargin())
+        target_fmt.setRightMargin(source_fmt.rightMargin())
+        target_fmt.setTopMargin(source_fmt.topMargin())
+        target_fmt.setBottomMargin(source_fmt.bottomMargin())
+        target_fmt.setBackground(source_fmt.background())
+        d.rootFrame().setFrameFormat(target_fmt)
         return d
 
     def _configured_printer(self) -> QPrinter:
@@ -984,34 +1015,161 @@ class MainWindow(QMainWindow):
         if not c.hasSelection():
             QMessageBox.information(self, "Nothing selected", "Select Hinglish text first.")
             return
-        raw = c.selectedText().replace("\u2029", "\n")
+        
         try:
-            out = hinglish_selection_to_krutidev(raw)
+            # Get selected text
+            selected_text = c.selectedText().replace("\u2029", "\n")
+            
+            # Convert the selection
+            converted_text = hinglish_selection_to_krutidev(selected_text)
+            
+            # Create format for converted text
+            kruti_fmt = QTextCharFormat()
+            if self.kruti_family:
+                kruti_fmt.setFontFamily(self.kruti_family)
+            kruti_fmt.setFontPointSize(float(self._current_point_size()))
+            
+            # Replace selected text
+            c.beginEditBlock()
+            c.removeSelectedText()
+            c.insertText(converted_text, kruti_fmt)
+            c.endEditBlock()
+            
+            self._apply_kruti_display_after_convert()
         except Exception as e:
             QMessageBox.warning(self, "Convert failed", str(e))
-            return
-        fmt = self._kruti_char_format()
-        c.beginEditBlock()
-        c.insertText(out, fmt)
-        c.endEditBlock()
-        self._apply_kruti_display_after_convert()
 
     def _convert_document(self) -> None:
-        plain = self.editor.toPlainText()
+        """Convert document from Hinglish to Kruti Dev while preserving formatting."""
         try:
-            out = hinglish_document_to_krutidev(plain)
+            # Get all text
+            plain_text = self.editor.toPlainText()
+            
+            # Convert the entire document
+            converted_text = hinglish_document_to_krutidev(plain_text)
+            
+            # Create format with Kruti font
+            kruti_fmt = QTextCharFormat()
+            if self.kruti_family:
+                kruti_fmt.setFontFamily(self.kruti_family)
+            kruti_fmt.setFontPointSize(float(self._current_point_size()))
+            
+            # Replace all text
+            self.editor.selectAll()
+            c = self.editor.textCursor()
+            c.beginEditBlock()
+            c.removeSelectedText()
+            c.insertText(converted_text, kruti_fmt)
+            c.endEditBlock()
+            
+            # Move cursor to start
+            c.movePosition(QTextCursor.MoveOperation.Start)
+            self.editor.setTextCursor(c)
+            
+            self._apply_kruti_display_after_convert()
         except Exception as e:
             QMessageBox.warning(self, "Convert failed", str(e))
+
+    def _export_document_to_docx(self, path: Path) -> None:
+        """Export editor content to DOCX with formatting preserved."""
+        if not Document or not Pt:
+            QMessageBox.warning(self, 'Error', 'python-docx not available')
             return
-        fmt = self._kruti_char_format()
-        self.editor.selectAll()
-        c = self.editor.textCursor()
-        c.beginEditBlock()
-        c.insertText(out, fmt)
-        c.endEditBlock()
-        c.movePosition(QTextCursor.MoveOperation.Start)
-        self.editor.setTextCursor(c)
-        self._apply_kruti_display_after_convert()
+            
+        doc = Document()
+        text_doc = self.editor.document()
+        
+        # Set default margins (1 inch on all sides)
+        sections = doc.sections
+        for section in sections:
+            section.top_margin = section.bottom_margin = section.left_margin = section.right_margin = Pt(72)
+        
+        # Remove default empty paragraph
+        while len(doc.paragraphs) > 0:
+            p = doc.paragraphs[0]._element
+            p.getparent().remove(p)
+        
+        # Iterate through blocks (paragraphs) in QTextDocument
+        block = text_doc.firstBlock()
+        while block.isValid():
+            block_text = block.text()
+            
+            # Get paragraph formatting
+            block_fmt = block.blockFormat()
+            p_align = block_fmt.alignment()
+            
+            # Create paragraph in docx
+            docx_para = doc.add_paragraph()
+            
+            # Set alignment
+            if p_align == Qt.AlignmentFlag.AlignCenter:
+                docx_para.alignment = 1  # WD_ALIGN_PARAGRAPH.CENTER
+            elif p_align == Qt.AlignmentFlag.AlignRight:
+                docx_para.alignment = 2  # WD_ALIGN_PARAGRAPH.RIGHT
+            elif p_align == Qt.AlignmentFlag.AlignJustify:
+                docx_para.alignment = 3  # WD_ALIGN_PARAGRAPH.JUSTIFY
+            else:
+                docx_para.alignment = 0  # WD_ALIGN_PARAGRAPH.LEFT
+            
+            # Set paragraph spacing and line height
+            paragraph_format = docx_para.paragraph_format
+            if block_fmt.topMargin() > 0:
+                paragraph_format.space_before = Pt(block_fmt.topMargin())
+            if block_fmt.bottomMargin() > 0:
+                paragraph_format.space_after = Pt(block_fmt.bottomMargin())
+            if block_fmt.lineHeight() > 0:
+                paragraph_format.line_spacing = block_fmt.lineHeight() / 100.0
+            elif block_fmt.lineHeightType() == 0:  # QTextBlockFormat.SingleHeight
+                paragraph_format.line_spacing = 1.0
+            
+            paragraph_format.left_indent = Pt(max(0, block_fmt.leftMargin()))
+            paragraph_format.right_indent = Pt(max(0, block_fmt.rightMargin()))
+            paragraph_format.first_line_indent = Pt(block_fmt.indent())
+            
+            # Process text with formatting
+            if block_text:
+                # Build a list of (text, format) tuples by detecting format changes
+                runs = []
+                cursor = QTextCursor(text_doc)
+                cursor.setPosition(block.position())
+                
+                i = 0
+                while i < len(block_text):
+                    cursor.setPosition(block.position() + i)
+                    fmt = cursor.charFormat()
+                    
+                    # Collect text until format changes
+                    j = i + 1
+                    while j < len(block_text):
+                        cursor.setPosition(block.position() + j)
+                        next_fmt = cursor.charFormat()
+                        # Compare key formatting attributes
+                        if (fmt.fontFamily() != next_fmt.fontFamily() or
+                            abs(fmt.fontPointSize() - next_fmt.fontPointSize()) > 0.1 or
+                            fmt.fontWeight() != next_fmt.fontWeight() or
+                            fmt.fontItalic() != next_fmt.fontItalic() or
+                            fmt.fontUnderline() != next_fmt.fontUnderline()):
+                            break
+                        j += 1
+                    
+                    runs.append((block_text[i:j], fmt))
+                    i = j
+                
+                # Add runs to paragraph
+                for text, fmt in runs:
+                    if text:
+                        run = docx_para.add_run(text)
+                        run.font.name = fmt.fontFamily() if fmt.fontFamily() else "Segoe UI"
+                        if fmt.fontPointSize() > 0:
+                            run.font.size = Pt(int(round(fmt.fontPointSize())))
+                        run.bold = fmt.fontWeight() >= 600
+                        run.italic = fmt.fontItalic()
+                        run.underline = fmt.fontUnderline()
+            
+            # Move to next block
+            block = block.next()
+        
+        doc.save(path)
 
     def _open_file(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -1026,10 +1184,75 @@ class MainWindow(QMainWindow):
         if p.suffix.lower() == '.docx' and Document:
             try:
                 doc = Document(p)
-                text = '\\n'.join(para.text for para in doc.paragraphs)
-                self.editor.setPlainText(text)
-            except:
-                QMessageBox.warning(self, 'Open failed', 'Could not read DOCX.')
+                # Load DOCX with formatting preserved
+                q_doc = self.editor.document()
+                q_doc.clear()
+                
+                cursor = QTextCursor(q_doc)
+                for para in doc.paragraphs:
+                    # Set paragraph formatting
+                    block_fmt = QTextBlockFormat()
+                    
+                    # Set alignment
+                    alignment = para.alignment
+                    if alignment == 1:  # CENTER
+                        block_fmt.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                    elif alignment == 2:  # RIGHT
+                        block_fmt.setAlignment(Qt.AlignmentFlag.AlignRight)
+                    elif alignment == 3:  # JUSTIFY
+                        block_fmt.setAlignment(Qt.AlignmentFlag.AlignJustify)
+                    else:  # LEFT
+                        block_fmt.setAlignment(Qt.AlignmentFlag.AlignLeft)
+                    
+                    # Set spacing and indentation
+                    pf = para.paragraph_format
+                    if pf.space_before:
+                        block_fmt.setTopMargin(int(pf.space_before))
+                    if pf.space_after:
+                        block_fmt.setBottomMargin(int(pf.space_after))
+                    if pf.left_indent:
+                        block_fmt.setLeftMargin(int(pf.left_indent))
+                    if pf.right_indent:
+                        block_fmt.setRightMargin(int(pf.right_indent))
+                    if pf.first_line_indent:
+                        block_fmt.setIndent(int(pf.first_line_indent))
+                    if pf.line_spacing:
+                        block_fmt.setLineHeight(int(pf.line_spacing * 100), 0)
+                    
+                    # Process runs
+                    for run in para.runs:
+                        fmt = QTextCharFormat()
+                        if run.font.name:
+                            fmt.setFontFamily(run.font.name)
+                        else:
+                            fmt.setFontFamily("Segoe UI")
+                        
+                        if run.font.size:
+                            try:
+                                # python-docx stores size in EMU (English Metric Units)
+                                # 12700 EMU = 1 point
+                                pt_size = int(run.font.size / 12700)
+                                fmt.setFontPointSize(pt_size)
+                            except:
+                                fmt.setFontPointSize(12)
+                        else:
+                            fmt.setFontPointSize(12)
+                        
+                        if run.bold:
+                            fmt.setFontWeight(700)
+                        if run.italic:
+                            fmt.setFontItalic(True)
+                        if run.underline:
+                            fmt.setFontUnderline(True)
+                        
+                        cursor.setBlockFormat(block_fmt)
+                        cursor.insertText(run.text, fmt)
+                    
+                    cursor.insertBlock(block_fmt)
+                
+                self._apply_document_page_geometry()
+            except Exception as e:
+                QMessageBox.warning(self, 'Open failed', f'Could not read DOCX: {str(e)}')
                 return
         else:
             text = p.read_text(encoding="utf-8", errors="replace")
@@ -1051,11 +1274,9 @@ class MainWindow(QMainWindow):
         p = Path(path)
         if p.suffix.lower() == '.docx' and Document:
             try:
-                doc = Document()
-                doc.add_paragraph(self.editor.toPlainText())
-                doc.save(p)
-            except:
-                QMessageBox.warning(self, 'Save failed', 'Could not save DOCX.')
+                self._export_document_to_docx(p)
+            except Exception as e:
+                QMessageBox.warning(self, 'Save failed', f'Could not save DOCX: {str(e)}')
                 return
         elif p.suffix.lower() == ".txt":
             p.write_text(self.editor.toPlainText(), encoding="utf-8")
